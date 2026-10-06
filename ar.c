@@ -107,6 +107,29 @@ void __unthrottle( void* cpu) {
     atomic_set(&cinfo->throttler_task,false);
 }
 
+/* Throttles the CPU using architecture specific primitives. Otherwise
+ * falls back to spinning on cpu_relax(). */
+static inline void ar_throttle_cpu_wait(struct core_info *cinfo)
+{
+#if defined(__x86_64__) || defined(__i386__)
+    if (!boot_cpu_has(X86_FEATURE_MWAIT)) {
+        smp_mb();
+        cpu_relax();
+        return;
+    }
+
+    __monitor(&cinfo->throttler_task, 0, 0);
+    smp_mb();
+    if (atomic_read(&cinfo->throttler_task) && !kthread_should_stop())
+        __mwait(0, 0);
+#elif defined(__aarch64__) || defined(__arm__)
+    wfe();
+    smp_mb();
+#else
+    smp_mb();
+    cpu_relax();
+#endif
+}
 
 /**************************************************************************
  * Callbacks and Handlers
@@ -137,27 +160,11 @@ static int throttler_task_func1(void * data){
             break;
 
         AR_DEBUG("CPU(%d):Throttling with MWAIT...\n",cpu_id);
-       
-       /* Use x86 MWAIT instruction for power-efficient throttling */
-       while (atomic_read(&cinfo->throttler_task) && !kthread_should_stop()) {
-           if (boot_cpu_has(X86_FEATURE_MWAIT)) {
-               /* MONITOR: Set up address to watch */
-               __monitor(&cinfo->throttler_task, 0, 0);
-               
-               /* Recheck after MONITOR to avoid race */
-               smp_mb();
-               if (atomic_read(&cinfo->throttler_task) && !kthread_should_stop()) {
-                   /* MWAIT: Enter low-power state until memory write */
-                   __mwait(0, 0);
-               }
-           } else {
-               /* Fallback if MWAIT not available */
-               smp_mb();
-               cpu_relax();
-           }
-       }
-       
-       AR_DEBUG("CPU(%d):Unthrottled\n",cpu_id);
+
+        while (atomic_read(&cinfo->throttler_task) && !kthread_should_stop())
+            ar_throttle_cpu_wait(cinfo);
+
+        AR_DEBUG("CPU(%d):Unthrottled\n",cpu_id);
     }
 
     pr_info("%s: Exit",__func__);
