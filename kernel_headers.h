@@ -31,11 +31,16 @@
 #include <linux/cpumask.h>
 #include <linux/topology.h>
 #include <linux/kfifo.h>
-#include <asm/fpu/api.h>
 #include <linux/init.h>
 #include <linux/hw_breakpoint.h>
 #include <linux/kstrtox.h>
 #include <linux/math64.h>
+
+#if defined(__aarch64__) || defined(__arm__)
+#include <asm/fpu.h>
+#elif defined(__x86_64__) || defined(__i386__)
+#include <asm/fpu/api.h>
+#endif
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(5, 0, 0)
 #  include <uapi/linux/sched/types.h>
