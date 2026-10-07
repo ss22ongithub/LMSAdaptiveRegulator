@@ -61,6 +61,12 @@ module_param(g_pool_bw_mb, ulong, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 u64 g_initial_bw_mb[MAX_NO_CPUS+1] = {0,500,500,500,500}; /*Pre-defined initial / min Bandwidth in MB/s */
 const u64 g_percore_bw_limit_mb[MAX_NO_CPUS+1] = {0,1000,1000,1000,1000}; /*Pre-defined max Bandwidth per core in MB/s */
 
+/* CPU 0 is always the master core (kernel ties boot/IRQ-affine duties to it,
+ * so it's never a good regulation target); CPUs 1..g_num_regulated_cpus are
+ * regulated. Computed once in ar_init() from num_online_cpus()-1, capped at
+ * MAX_NO_CPUS since all_cinfo and the bandwidth tables are sized for that. */
+u8 g_num_regulated_cpus;
+
 /**************************************************************************
  * Static Types
  ***************************************************************************/
@@ -395,7 +401,7 @@ void start_all_regulation(void){
     master_start_regulation();
     
     /* Enable perf counters for all cores */
-    for (u8 cpu_id = 1; cpu_id <= 4; cpu_id++) {
+    for (u8 cpu_id = 1; cpu_id <= g_num_regulated_cpus; cpu_id++) {
         start_regulation(cpu_id);
     }
     
@@ -409,7 +415,7 @@ void stop_all_regulation(void){
     master_stop_regulation();
     
     /* Disable perf counters for all cores */
-    for (u8 cpu_id = 1; cpu_id <= 4; cpu_id++) {
+    for (u8 cpu_id = 1; cpu_id <= g_num_regulated_cpus; cpu_id++) {
         stop_regulation(cpu_id);
     }
     
@@ -437,39 +443,28 @@ static int __init ar_init (void ){
     //Initialise core infos
     memset(all_cinfo, 0, sizeof(all_cinfo));
 
-    //Setup CPU info for CPU 1,2, 3, 4
-    int ret = setup_cpu_info((u8)1);
-    if (ret != 0){
-        pr_err("setup_cpu() Failed");
-        deinitialize_cpu_info(1);
-        return -ENOMEM;
+    /* CPU 0 is always reserved for the master thread; regulate the rest,
+     * up to however many this board actually has (clamped to MAX_NO_CPUS,
+     * which is what all_cinfo and the bandwidth tables are sized for). */
+    g_num_regulated_cpus = num_online_cpus() - 1;
+    if (g_num_regulated_cpus > MAX_NO_CPUS)
+        g_num_regulated_cpus = MAX_NO_CPUS;
+    if (g_num_regulated_cpus < 1) {
+        pr_err("Need at least 2 online CPUs (1 master + >=1 regulated), found %d\n",
+               num_online_cpus());
+        return -ENODEV;
     }
+    pr_info("Regulating %d of %d online CPUs (CPU 0 reserved for master)\n",
+            g_num_regulated_cpus, num_online_cpus());
 
-    ret = setup_cpu_info((u8)2);
-    if (ret != 0){
-        pr_err("setup_cpu() Failed");
-        deinitialize_cpu_info((u8)2);
-        deinitialize_cpu_info((u8)1);
-        return -ENOMEM;
-    }
-
-    ret = setup_cpu_info((u8)3);
-    if (ret != 0){
-        pr_err("setup_cpu() Failed");
-        deinitialize_cpu_info((u8)3);
-        deinitialize_cpu_info((u8)2);
-        deinitialize_cpu_info((u8)1);
-        return -ENOMEM;
-    }
-
-    ret = setup_cpu_info((u8)4);
-    if (ret != 0){
-        pr_err("setup_cpu() Failed");
-        deinitialize_cpu_info((u8)4);
-        deinitialize_cpu_info((u8)3);
-        deinitialize_cpu_info((u8)2);
-        deinitialize_cpu_info((u8)1);
-        return -ENOMEM;
+    for (u8 cpu_id = 1; cpu_id <= g_num_regulated_cpus; cpu_id++) {
+        int ret = setup_cpu_info(cpu_id);
+        if (ret != 0) {
+            pr_err("setup_cpu() Failed for CPU %d", cpu_id);
+            for (int rollback_id = cpu_id - 1; rollback_id >= 1; rollback_id--)
+                deinitialize_cpu_info((u8)rollback_id);
+            return -ENOMEM;
+        }
     }
 
     /* Initialize the master thread - this will throttle all cores */
@@ -489,14 +484,9 @@ static void __exit ar_exit( void )
     /* Keep the deinitializing sequence reverse of the allocation sequence seen in  __init function */
     ar_remove_debugfs();
     deinitialize_master();
-    
-    deinitialize_cpu_info((u8)1);
-    
-    deinitialize_cpu_info((u8)2);
-    
-    deinitialize_cpu_info((u8)3);
-    
-    deinitialize_cpu_info((u8)4);
+
+    for (int cpu_id = g_num_regulated_cpus; cpu_id >= 1; cpu_id--)
+        deinitialize_cpu_info((u8)cpu_id);
 
     pr_info("Module removed\n");
 	return;
