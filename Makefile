@@ -41,6 +41,15 @@ ccflags-y += -mhard-float -msse
 endif
 endif
 
+# arm64's Kbuild compiles everything with -mgeneral-regs-only by default,
+# which forbids FP/NEON codegen outright -- model.c/master.c/utils.c do
+# plain `double` arithmetic (LMS weight updates, print_double()), so remove
+# it for just those objects. No-op on x86/riscv, where the flag is never
+# added in the first place.
+CFLAGS_REMOVE_model.o  += -mgeneral-regs-only
+CFLAGS_REMOVE_master.o += -mgeneral-regs-only
+CFLAGS_REMOVE_utils.o  += -mgeneral-regs-only
+
 # Enable debug traces (comment out to disable)
 # ccflags-y += -DCONFIG_DEBUG_AR
 
