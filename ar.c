@@ -224,7 +224,7 @@ static int  setup_cpu_info(const u8 cpu_id){
     pr_info("%s: Enter CPU(%d)", __func__,cpu_id );
     struct core_info* cinfo = get_core_info(cpu_id);
     BUG_ON(cinfo==NULL);
-    memset(cinfo, sizeof(struct core_info), 0);
+    memset(cinfo, 0, sizeof(struct core_info));
     cinfo->cpu_id = cpu_id;
 
     /* Initialize per-core bandwidth limits from global arrays */

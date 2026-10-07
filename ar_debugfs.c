@@ -113,7 +113,7 @@ static int ar_obs_interval_open(struct inode *inode, struct file *filp)
 static ssize_t ar_enable_reg_write(struct file *filp,
                                 const char __user *ubuf,size_t cnt, loff_t *ppos) {
     char buf[BUF_SIZE];
-    memset(buf,sizeof(buf),0);
+    memset(buf,0,sizeof(buf));
     u8 user_value = false ;
 
     if (copy_from_user(&buf, ubuf, (cnt > BUF_SIZE) ? BUF_SIZE: cnt) != 0)
