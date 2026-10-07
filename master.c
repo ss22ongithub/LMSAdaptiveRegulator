@@ -24,14 +24,15 @@ extern void __unthrottle( void* cpu );
 extern u64 g_initial_bw_mb[MAX_NO_CPUS+1];/*Pre-defined initial / min Bandwidth in MB/s */
 extern const u64 g_percore_bw_limit_mb[MAX_NO_CPUS+1]; /*Pre-defined max Bandwidth per core in MB/s */
 extern ulong g_pool_bw_mb;
+extern u8 g_num_regulated_cpus; /* CPU 0 is always master; set once in ar_init() */
 
 
 static int master_thread_func(void * data) {
     pr_info("%s: Enter",__func__);
 
-    /* Step 1: Immediately throttle all 4 cores */
+    /* Step 1: Immediately throttle all regulated cores */
     pr_info("%s: Throttling all cores at startup", __func__);
-    for (u8 cpu_id = 1; cpu_id <= 4; cpu_id++) {
+    for (u8 cpu_id = 1; cpu_id <= g_num_regulated_cpus; cpu_id++) {
         struct core_info* cinfo = get_core_info(cpu_id);
         if (cinfo) {
             __throttle((void*)cinfo);
@@ -52,7 +53,7 @@ static int master_thread_func(void * data) {
 
     /* Step 3: Unthrottle all cores when regulation begins */
     pr_info("%s: Regulation enabled, unthrottling all cores", __func__);
-    for (u8 cpu_id = 1; cpu_id <= 4; cpu_id++) {
+    for (u8 cpu_id = 1; cpu_id <= g_num_regulated_cpus; cpu_id++) {
         struct core_info* cinfo = get_core_info(cpu_id);
         if (cinfo) {
             __unthrottle((void*)cinfo);
