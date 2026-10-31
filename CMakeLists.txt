@@ -34,6 +34,8 @@ add_library(dummy  OBJECT
     master.h
     model.c
     model.h
+    mlp_weights.h
+    l2_bw_scalers.h
     utils.c
     utils.h
 )

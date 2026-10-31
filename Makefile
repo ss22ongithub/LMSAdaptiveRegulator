@@ -42,12 +42,13 @@ endif
 endif
 
 # arm64's Kbuild compiles everything with -mgeneral-regs-only by default,
-# which forbids FP/NEON codegen outright -- model.c/master.c/utils.c do
-# plain `double` arithmetic (LMS weight updates, print_double()), so remove
-# it for just those objects. No-op on x86/riscv, where the flag is never
-# added in the first place.
+# which forbids FP/NEON codegen outright. model.c holds the MLP forward pass
+# (float) and utils.c has print_double(), so remove it for just those
+# objects. master.c deliberately keeps the flag: it only brackets
+# mlp_step() with kernel_neon_begin()/end(), and the flag makes the compiler
+# reject any FP that leaks into it. No-op on x86/riscv, where the flag is
+# never added in the first place.
 CFLAGS_REMOVE_model.o  += -mgeneral-regs-only
-CFLAGS_REMOVE_master.o += -mgeneral-regs-only
 CFLAGS_REMOVE_utils.o  += -mgeneral-regs-only
 
 # Enable debug traces (comment out to disable)
@@ -68,9 +69,9 @@ KBUILD_ARCH_FLAGS += CROSS_COMPILE=$(CROSS_COMPILE)
 endif
 
 all:
-	$(MAKE) -C $(KDIR) $(KBUILD_ARCH_FLAGS) M=$(PWD) modules
+	$(MAKE) -C $(KDIR) $(KBUILD_ARCH_FLAGS) M=$(CURDIR) modules
 
 clean:
-	$(MAKE) -C $(KDIR) $(KBUILD_ARCH_FLAGS) M=$(PWD) clean
+	$(MAKE) -C $(KDIR) $(KBUILD_ARCH_FLAGS) M=$(CURDIR) clean
 
 .PHONY: all clean
