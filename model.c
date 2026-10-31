@@ -1,143 +1,91 @@
 #include "kernel_headers.h"
 #include "ar.h"
 #include "model.h"
-/**********************  Static Function Prototypes **********************************************/
-static double lms_predict(const u64* feat, u8 feat_len,double *wm, u8 wm_len, u8 ri);
-//static double avg(const u64 * f , u8 len );
-/**********************  Static  Function Prototypes **********************************************/
-
-
-/** Function Prototypes **/
-u64 estimate(u64* feat, u8 feat_len, double *wm, u8 wm_len, u8 index);
-void update_weight_matrix(s64 error, struct core_info *cinfo );
-void init_weight_matrix(struct core_info *cinfo);
+#include "mlp_weights.h"    /* emlearn-exported weights (data only) */
+#include "l2_bw_scalers.h"  /* MinMax constants from training */
 
 /** Constants **/
-const double  LRATE = 0.000001;
+#define H1 64
+#define H2 32
+#define MLP_IN (MLP_WINDOW * MLP_N_EV)
+
+static_assert(L2_BW_N_FEATURES == MLP_N_EV, "scaler/feature count mismatch");
+static_assert(L2_BW_WINDOW == MLP_WINDOW, "scaler/window size mismatch");
+
+/* Model output is GB/s (1e9 B/s); the regulator works in MiB/s (see convert_events_to_mb) */
+#define GBPS_TO_MIBPS (1e9f / (1024.0f * 1024.0f))
+
+/* Per-core sliding window of normalised features. Once full, head is the oldest slot. */
+struct mlp_state {
+    float win[MLP_WINDOW][MLP_N_EV];
+    u8 head;    /* next slot to write */
+    u8 count;   /* valid slots, saturates at MLP_WINDOW */
+};
+
+static struct mlp_state state[MAX_NO_CPUS + 1];
+
+/* Forward pass scratch. Only the master thread calls mlp_step(), so no locking. */
+static float x[MLP_IN];
+static float h1[H1];
+static float h2[H2];
 
 
-
-double lms_predict(const u64* feat, u8 feat_len,double *wm, u8 wm_len, u8 ri){
-    const double bias = 0.0;
-    double sum = 0.0f;
-    int i =0;
-    for (int j = ri; i < wm_len && j >= 0; i++, j--){
-        sum += wm[i] * feat[j];
-//        AR_DEBUG("wm[%d](%f) * feat[%d](%lu) = %f\n",i,wm[i],j,feat[j],wm[i] * feat[j] );
-    }
-    for (int j=feat_len-1; i < wm_len && j > ri ; i++,j--) {
-        sum += wm[i] * feat[j];
-//        AR_DEBUG("wm[%d](%f) * feat[%d](%lu) = %f\n",i,wm[i],j,feat[j],wm[i] * feat[j] );
-    }
-    sum+= bias;
-    return sum;
+static inline float clamp01(float v){
+    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
 }
 
-/*
-double avg(const u64 * f , u8 len ){
-    double sum = 0.0f;
-    u8 i = 0;
-    if (len == 0) {
-        return 0.0f;
-    }
-    for (i = 0; i < len; i++){
-        sum += f[i];
-    }
-    return (sum/len);
-}
-*/
+/* Weights are stored [input][output]: w[i * n_out + o] */
+static float mlp_forward(const float *in){
+    int o, i;
+    float s;
 
-u64 estimate(u64* feat, u8 feat_len, double *wm, u8 wm_len, u8 index) {
-
-    kernel_fpu_begin();
-    double result = lms_predict(feat,feat_len, wm ,  wm_len, index);
-    kernel_fpu_end();
-    
-    // Ignore fractional part of the results 
-    u64 integer_part = (int)result;
-    /*
-        u64 fractional_part = (int)((result - integer_part) * 1000000);
-        AR_DEBUG(" %llu.%llu \n", integer_part, fractional_part);
-     */
-    return integer_part;
+    for (o = 0; o < H1; o++) {
+        s = l2_bw_model_layer_0_biases[o];
+        for (i = 0; i < MLP_IN; i++)
+            s += l2_bw_model_layer_0_weights[i * H1 + o] * in[i];
+        h1[o] = s > 0.0f ? s : 0.0f;
+    }
+    for (o = 0; o < H2; o++) {
+        s = l2_bw_model_layer_1_biases[o];
+        for (i = 0; i < H1; i++)
+            s += l2_bw_model_layer_1_weights[i * H2 + o] * h1[i];
+        h2[o] = s > 0.0f ? s : 0.0f;
+    }
+    s = l2_bw_model_layer_2_biases[0];
+    for (i = 0; i < H2; i++)
+        s += l2_bw_model_layer_2_weights[i] * h2[i];
+    return s;
 }
 
-static u64 l2_norm(u64* feature, u8 feat_len){
-    u64 norm_sq = 0;
-    for (u8 i = 0; i < feat_len; ++i) {
-        norm_sq += mul_u64_u64_shr(feature[i],feature[i], 16) ;
-    }
-    return norm_sq;
+void mlp_reset(u8 cpu_id){
+    /* All-zero bits is 0.0f, so no FP section needed */
+    memset(&state[cpu_id], 0, sizeof(state[cpu_id]));
 }
 
-void 
-update_weight_matrix(s64 error, struct core_info* cinfo){
-    
-    // Avoid Divide by zero error
-    u64 norm_sq = l2_norm(cinfo->read_event_hist, HIST_SIZE);
-    if ( 0 == norm_sq){
-        // AR_DEBUG("CPU(%d): Norm Square=0, skipping weight update\n", cinfo->cpu_id);
-        return;
+/* noinline: the caller brackets this with kernel_neon_begin()/end() from
+ * non-FP code, so no FP instruction may be scheduled outside that section. */
+noinline bool mlp_step(u8 cpu_id, const u64 delta[MLP_N_EV], const u64 running_ns[MLP_N_EV],
+                       u64 *pred_mb){
+    struct mlp_state *s = &state[cpu_id];
+    bool ready;
+
+    /* Counts per ns, then MinMax-scaled (clipped to [0,1]) with the training constants */
+    for (int i = 0; i < MLP_N_EV; i++) {
+        float cpns = running_ns[i] ? (float)delta[i] / (float)running_ns[i] : 0.0f;
+        s->win[s->head][i] = clamp01((cpns - l2_bw_feat_min[i]) * l2_bw_feat_scale[i]);
     }
+    s->head = (s->head + 1) % MLP_WINDOW;
+    if (s->count < MLP_WINDOW)
+        s->count++;
 
-    // sign_bit: 1 = +ve , -1 = -ve. Convert error to a +ve value
-    const s8 sign_bit = (error < 0)?-1:1;
-    error = error * sign_bit;
-    // After this point error is always +ve
+    ready = (s->count == MLP_WINDOW);
+    if (ready) {
+        /* Flatten oldest -> newest, matching feat[i : i+W].ravel() in training */
+        for (int t = 0; t < MLP_WINDOW; t++)
+            memcpy(&x[t * MLP_N_EV], s->win[(s->head + t) % MLP_WINDOW], sizeof(s->win[0]));
 
-    double  product[HIST_SIZE] = {0};
-
-    kernel_fpu_begin();
-    for (u8 i = 0; i <HIST_SIZE ; ++i) {
-        u64 t1 = mul_u64_u64_shr(error,cinfo->read_event_hist[i],0);
-        double  t2 = t1 / norm_sq;
-        product[i] = t2 * LRATE;
-        // Sign bit is used while updating the weight vector
-        cinfo->weight_matrix[i] = cinfo->weight_matrix[i] + (sign_bit * product[i]);
+        float bw_mb = L2_BW_DENORM(mlp_forward(x)) * GBPS_TO_MIBPS;
+        *pred_mb = (bw_mb > 0.0f) ? (u64)bw_mb : 0;
     }
-    kernel_fpu_end();
-}
-
-void 
-update_write_weight_matrix(s64 error, struct core_info* cinfo){
-    
-    // Avoid Divide by zero error
-    u64 norm_sq = l2_norm(cinfo->write_event_hist, HIST_SIZE);
-    if ( 0 == norm_sq){
-        // AR_DEBUG("CPU(%d): Write Norm Square=0, skipping weight update\n", cinfo->cpu_id);
-        return;
-    }
-
-    // sign_bit: 1 = +ve , -1 = -ve. Convert error to a +ve value
-    const s8 sign_bit = (error < 0)?-1:1;
-    error = error * sign_bit;
-    // After this point error is always +ve
-
-    double  product[HIST_SIZE] = {0};
-
-    kernel_fpu_begin();
-    for (u8 i = 0; i <HIST_SIZE ; ++i) {
-        u64 t1 = mul_u64_u64_shr(error,cinfo->write_event_hist[i],0);
-        double  t2 = t1 / norm_sq;
-        product[i] = t2 * LRATE;
-        // Sign bit is used while updating the weight vector
-        cinfo->write_weight_matrix[i] = cinfo->write_weight_matrix[i] + (sign_bit * product[i]);
-    }
-    kernel_fpu_end();
-}
-
-void initialize_weight_matrix(struct core_info *cinfo, bool first){
-    kernel_fpu_begin();
-  	for(u8 i =0 ; i < HIST_SIZE; i++){
-       	cinfo->weight_matrix[i] = (first)? INITIAL_WEIGHT : (cinfo->weight_matrix[i])/2;
-  	}
-    kernel_fpu_end();
-}
-
-void initialize_write_weight_matrix(struct core_info *cinfo, bool first){
-    kernel_fpu_begin();
-  	for(u8 i =0 ; i < HIST_SIZE; i++){
-       	cinfo->write_weight_matrix[i] = (first)? INITIAL_WEIGHT : (cinfo->write_weight_matrix[i])/2;
-  	}
-    kernel_fpu_end();
+    return ready;
 }

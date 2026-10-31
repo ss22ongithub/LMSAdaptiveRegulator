@@ -58,8 +58,16 @@ module_param(g_pool_bw_mb, ulong, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
  * Global Variables
  **************************************************************************/
 
-u64 g_initial_bw_mb[MAX_NO_CPUS+1] = {0,500,500,500,500}; /*Pre-defined initial / min Bandwidth in MB/s */
-const u64 g_percore_bw_limit_mb[MAX_NO_CPUS+1] = {0,1000,1000,1000,1000}; /*Pre-defined max Bandwidth per core in MB/s */
+/* Per-core budget bounds in MB/s, applied to every regulated core */
+static ulong initial_bw_mb = 500;   /* Initial budget, and floor for the prediction */
+module_param(initial_bw_mb, ulong, S_IRUSR | S_IRGRP);
+static ulong max_bw_mb = 1000;      /* Cap on the per-core budget */
+module_param(max_bw_mb, ulong, S_IRUSR | S_IRGRP);
+
+/* Predict and log as usual, but always grant max_bw_mb, so nothing is
+ * throttled. Used to measure prediction accuracy and pure module overhead. */
+bool observe_only = false;
+module_param(observe_only, bool, S_IRUSR | S_IRGRP);
 
 /* CPU 0 is always the master core (kernel ties boot/IRQ-affine duties to it,
  * so it's never a good regulation target); CPUs 1..g_num_regulated_cpus are
@@ -72,6 +80,20 @@ u8 g_num_regulated_cpus;
  ***************************************************************************/
 
 static struct core_info all_cinfo[MAX_NO_CPUS + 1];
+
+/* PMU events of the MLP features that are not already counted by
+ * read_event/write_event (those two entries stay 0 and are aliased). */
+static const int g_feat_counter_id[MLP_N_EV] = {
+    [MLP_EV_CYCLES]       = PMU_CPU_CYCLES_ID,
+    [MLP_EV_INSTRUCTIONS] = PMU_INST_RETIRED_ID,
+    [MLP_EV_L1I_CACHE]    = PMU_L1I_CACHE_ID,
+    [MLP_EV_BUS_ACCESS]   = PMU_BUS_ACCESS_ID,
+    [MLP_EV_BUS_CYCLES]   = PMU_BUS_CYCLES_ID,
+};
+
+static inline bool feat_event_is_owned(u8 i){
+    return i != MLP_EV_L2D_REFILL && i != MLP_EV_L2D_WB;
+}
 
 /**************************************************************************
  * Utils
@@ -200,7 +222,7 @@ static void ar_handle_read_overflow(struct irq_work *entry)
         AR_DEBUG("%s: CPU(%d) not expected here\n",__func__,cpu_id);
         return;
     }
-    BUG_ON(in_nmi() || !in_irq());
+    BUG_ON(in_nmi() || !in_hardirq());
 
     struct core_info *cinfo = get_core_info(cpu_id);
     BUG_ON(!cinfo);
@@ -211,11 +233,13 @@ static void ar_handle_read_overflow(struct irq_work *entry)
         reclaim_budget = read_bw_used/2;
         g_pool_bw_mb -=  reclaim_budget;
         local64_set(&cinfo->read_event->hw.period_left, reclaim_budget);
+        stat_add(&cinfo->stats.reclaims, 1);
         AR_DEBUG("read_bw_used(%llu) < g_pool_bw_mb(%lu): reclaim_budget(%llu)", read_bw_used, g_pool_bw_mb, reclaim_budget);
         return;
     }
 
     //Activate Throttling
+    stat_add(&cinfo->stats.throttles, 1);
     atomic_set(&cinfo->throttler_task,true);
     wake_up_interruptible(&cinfo->throttle_evt);
 
@@ -233,14 +257,17 @@ static int  setup_cpu_info(const u8 cpu_id){
     memset(cinfo, 0, sizeof(struct core_info));
     cinfo->cpu_id = cpu_id;
 
-    /* Initialize per-core bandwidth limits from global arrays */
-    cinfo->initial_bw_mb = g_initial_bw_mb[cpu_id];
-    cinfo->max_bw_limit_mb = g_percore_bw_limit_mb[cpu_id];
+    /* Initialize per-core bandwidth limits from the module parameters */
+    cinfo->initial_bw_mb = initial_bw_mb;
+    cinfo->max_bw_limit_mb = max_bw_mb;
+
+    /* Budget the counters hold until the master's first allocation */
+    u64 start_bw_mb = observe_only ? cinfo->max_bw_limit_mb : cinfo->initial_bw_mb;
     pr_info("CPU %d: initial_bw=%llu MB/s, max_bw=%llu MB/s\n", 
             cpu_id, cinfo->initial_bw_mb, cinfo->max_bw_limit_mb);
 
     cinfo->read_event =  init_counter(cinfo->cpu_id,
-                                     convert_mb_to_events(g_initial_bw_mb[cpu_id]),
+                                     convert_mb_to_events(start_bw_mb),
                                      g_read_counter_id,
                                      read_event_overflow_callback);
     if (cinfo->read_event == NULL){
@@ -249,12 +276,26 @@ static int  setup_cpu_info(const u8 cpu_id){
     }
     
     cinfo->write_event = init_counter(cinfo->cpu_id,
-                                      convert_mb_to_events(g_initial_bw_mb[cpu_id]),
+                                      convert_mb_to_events(start_bw_mb),
                                       PMU_LLC_WB_COUNTER_ID,
                                       NULL);  /* No callback for write - we don't throttle on write alone */
     if (cinfo->write_event == NULL){
         pr_err("Write_event %p did not allocate ", cinfo->write_event);
         return -1;
+    }
+
+    /* MLP feature counters: reuse the read/write events, add counting-only
+     * events (sample_period 0, no callback) for the rest */
+    cinfo->feat_event[MLP_EV_L2D_REFILL] = cinfo->read_event;
+    cinfo->feat_event[MLP_EV_L2D_WB] = cinfo->write_event;
+    for (u8 i = 0; i < MLP_N_EV; i++) {
+        if (!feat_event_is_owned(i))
+            continue;
+        cinfo->feat_event[i] = init_counter(cinfo->cpu_id, 0, g_feat_counter_id[i], NULL);
+        if (cinfo->feat_event[i] == NULL){
+            pr_err("Feature event 0x%x did not allocate ", g_feat_counter_id[i]);
+            return -1;
+        }
     }
     
     /* cycles_l3miss_event disabled
@@ -305,10 +346,6 @@ static int  setup_cpu_info(const u8 cpu_id){
     /***** Regulation to be started by setting
     /sys/kernel/debug/ar/enable_regulation to 1 ****/
 
-    /* Initialize weight matrices for both read and write bandwidth estimation */
-    initialize_weight_matrix(cinfo, true);        // Read BW weights
-    initialize_write_weight_matrix(cinfo, true);  // Write BW weights
-
     pr_info("%s: Exit", __func__ );
     return 0;
 }
@@ -337,6 +374,13 @@ static void deinitialize_cpu_info( const u8 cpu_id){
     }
     
     //Free the perf event counters
+    for (u8 i = 0; i < MLP_N_EV; i++) {
+        if (feat_event_is_owned(i) && cinfo->feat_event[i]) {
+            disable_event(cinfo->feat_event[i]);
+        }
+        cinfo->feat_event[i] = NULL;
+    }
+
     if (cinfo->read_event) {
         disable_event(cinfo->read_event);
         cinfo->read_event = NULL;
@@ -361,17 +405,17 @@ void start_regulation(u8 cpu_id){
     struct core_info* cinfo = get_core_info(cpu_id);
     BUG_ON(cinfo==NULL);
     
-    /* Initialize read estimates */
+    /* Initialize estimates */
     cinfo->next_estimate = 0;
     cinfo->prev_estimate = 0;
-    
-    /* Initialize write estimates */
-    cinfo->write_next_estimate = 0;
-    cinfo->write_prev_estimate = 0;
 
-    /* Enable perf events */
-    enable_event(cinfo->read_event);
-    enable_event(cinfo->write_event);
+    /* Fresh model window; the master's first tick re-reads the counter baselines */
+    mlp_reset(cpu_id);
+    cinfo->primed = false;
+
+    /* Enable perf events (includes read_event and write_event) */
+    for (u8 i = 0; i < MLP_N_EV; i++)
+        enable_event(cinfo->feat_event[i]);
     //enable_event(cinfo->cycles_l3miss_event);
 
     /* Note: Timers are not used in this design.
@@ -384,9 +428,9 @@ void stop_regulation(u8 cpu_id){
     struct core_info* cinfo = get_core_info(cpu_id);
     BUG_ON(cinfo==NULL);
 
-    /* Disable perf events */
-    perf_event_disable(cinfo->read_event);
-    perf_event_disable(cinfo->write_event);
+    /* Disable perf events (includes read_event and write_event) */
+    for (u8 i = 0; i < MLP_N_EV; i++)
+        perf_event_disable(cinfo->feat_event[i]);
     //perf_event_disable(cinfo->cycles_l3miss_event);
 
     /* Note: Timers are not used in this design */
@@ -397,13 +441,14 @@ void stop_regulation(u8 cpu_id){
 void start_all_regulation(void){
     pr_info("%s: Starting regulation for all cores", __func__);
     
-    /* Signal master thread to unthrottle cores and begin regulation */
-    master_start_regulation();
-    
-    /* Enable perf counters for all cores */
+    /* Enable perf counters for all cores first: the master thread starts
+     * reading/reprogramming them as soon as it is woken below. */
     for (u8 cpu_id = 1; cpu_id <= g_num_regulated_cpus; cpu_id++) {
         start_regulation(cpu_id);
     }
+
+    /* Signal master thread to unthrottle cores and begin regulation */
+    master_start_regulation();
     
     pr_info("%s: All cores regulation started", __func__);
 }
@@ -456,6 +501,13 @@ static int __init ar_init (void ){
     }
     pr_info("Regulating %d of %d online CPUs (CPU 0 reserved for master)\n",
             g_num_regulated_cpus, num_online_cpus());
+
+    if (initial_bw_mb == 0 || initial_bw_mb > max_bw_mb) {
+        pr_err("Need 0 < initial_bw_mb (%lu) <= max_bw_mb (%lu)\n", initial_bw_mb, max_bw_mb);
+        return -EINVAL;
+    }
+    pr_info("Budget: initial=%lu MB/s, max=%lu MB/s, observe_only=%d\n",
+            initial_bw_mb, max_bw_mb, observe_only);
 
     for (u8 cpu_id = 1; cpu_id <= g_num_regulated_cpus; cpu_id++) {
         int ret = setup_cpu_info(cpu_id);

@@ -25,4 +25,4 @@ send_files.sh
 tmp/
 refactorings/
 cmake-build-debug
-
+results/.obsidian/

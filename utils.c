@@ -48,19 +48,17 @@ void print_double(char* buf, double value)
 u64 convert_events_to_mb(u64 events)
 {
 /*
- * BW  = (event * CACHE_LINE_SIZE)/ time_in_ms  - bytes/ms
- *     =  (event * CACHE )/ (time_in_ms * 1024 *1024)  = mb/ms
- *     =  (event * CACHE * 1000 )/ (time_in_sec * 1024 *1024)  = mb/s
+ * BW  = (events * CACHE_LINE_SIZE) / time_in_us                        - bytes/us
+ *     = (events * CACHE_LINE_SIZE * 1000000) / (time_in_us * 1024 * 1024)  - MiB/s
+ * Rounded up. events is a per-interval delta, so the product cannot overflow.
  */
-    int divisor = get_regulation_time()*1024*1024;
-    int mb = div64_u64(events*CACHE_LINE_SIZE*1000 + (divisor-1), divisor);
-    return mb;
-	/* The bandwidth computed here is has units Mib/msec but it is scaled by a factor of 10000.  */
+    u64 divisor = (u64)get_regulation_time() * 1024 * 1024;
+    return div64_u64(events * CACHE_LINE_SIZE * USEC_PER_SEC + (divisor - 1), divisor);
 }
 
-u64 convert_mb_to_events(int mb)
+u64 convert_mb_to_events(u64 mb)
 {
-    return div64_u64((u64)mb*1024*1024,
-                     CACHE_LINE_SIZE * (1000/get_regulation_time()));
+    return div64_u64(mb * 1024 * 1024 * get_regulation_time(),
+                     CACHE_LINE_SIZE * USEC_PER_SEC);
 }
 /* Placeholder for any utility function used adaptive regulation */

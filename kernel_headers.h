@@ -37,7 +37,7 @@
 #include <linux/math64.h>
 
 #if defined(__aarch64__) || defined(__arm__)
-#include <asm/fpu.h>
+#include <asm/neon.h>
 #elif defined(__x86_64__) || defined(__i386__)
 #include <asm/fpu/api.h>
 #endif

@@ -23,17 +23,19 @@
 /**************************************************************************
  * Globals
  **************************************************************************/
-static u32 ar_regulation_time_ms = 1; //ms, default 1000ms
+static u32 ar_regulation_time_us = 2270; //us, MLP training cadence (2.27 ms)
 static u32 ar_observation_time_ms = 1000;
 atomic_t enable_reg; // Memory regulation enabled or disabled via debugfs
 static struct dentry *ar_dir = NULL;
+
+extern u8 g_num_regulated_cpus;
 
 /****************************************
  * Fops functions for Regulation interval
  ****************************************/
 static int ar_reg_interval_show(struct seq_file *m, void *v)
 {
-    int tmp = ar_regulation_time_ms;
+    int tmp = ar_regulation_time_us;
     pr_info("%s: Reading.",__func__);
     seq_printf(m, "%u\n",tmp);
     return 0;
@@ -63,7 +65,11 @@ static ssize_t ar_reg_interval_write(struct file *filp,
         return ret;
     }
 
-    ar_regulation_time_ms =  tmp;
+    /* Used as a divisor in the bandwidth conversions */
+    if (tmp == 0)
+        return -EINVAL;
+
+    ar_regulation_time_us =  tmp;
     return cnt;
 }
 
@@ -160,6 +166,28 @@ static int ar_enable_reg_open(struct inode *inode, struct file *filp)
     return single_open(filp,ar_enable_reg_read , NULL);
 }
 /****************************************
+ * Fops functions for per-core stats
+ ****************************************/
+static int ar_stats_show(struct seq_file *m, void *v)
+{
+    seq_puts(m, "cpu ticks cycles instructions l2_refill l2_wb reclaims throttles\n");
+    for (u8 cpu_id = 1; cpu_id <= g_num_regulated_cpus; cpu_id++) {
+        struct ar_stats *s = &get_core_info(cpu_id)->stats;
+        seq_printf(m, "%u %llu %llu %llu %llu %llu %llu %llu\n", cpu_id,
+                   READ_ONCE(s->ticks), READ_ONCE(s->cycles),
+                   READ_ONCE(s->instructions), READ_ONCE(s->l2_refill),
+                   READ_ONCE(s->l2_wb), READ_ONCE(s->reclaims),
+                   READ_ONCE(s->throttles));
+    }
+    return 0;
+}
+
+static int ar_stats_open(struct inode *inode, struct file *filp)
+{
+    return single_open(filp, ar_stats_show, NULL);
+}
+
+/****************************************
  * debug Fops 
  ****************************************/
 
@@ -179,6 +207,12 @@ static const struct file_operations ar_reg_interval_fops = {
 };
 
 
+static const struct file_operations ar_stats_fops = {
+    .open       = ar_stats_open,
+    .read       = seq_read,
+    .release    = single_release,
+};
+
 static const struct file_operations ar_enable_reg = {
     .open       = ar_enable_reg_open,
     .write      = ar_enable_reg_write,
@@ -197,6 +231,8 @@ int ar_init_debugfs(void)
                 &ar_obs_interval_fops);
     debugfs_create_file("enable_regulation", 0444, ar_dir, NULL,
                         &ar_enable_reg);
+    debugfs_create_file("stats", 0444, ar_dir, NULL,
+                        &ar_stats_fops);
     return 0;
 }
 
@@ -205,6 +241,6 @@ inline void ar_remove_debugfs(void){
 }
 
 u32  get_regulation_time(void){
-	return ar_regulation_time_ms;
+	return ar_regulation_time_us;
 }
 

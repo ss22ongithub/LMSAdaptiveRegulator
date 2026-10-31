@@ -1,7 +1,8 @@
 #if !defined AR_H
 #define AR_H
 
-#define HIST_SIZE 5
+#include "model.h"
+
 #define MAX_NO_CPUS 4
 
 extern ulong g_total_available_bw_mb;
@@ -12,6 +13,15 @@ extern ulong g_total_available_bw_mb;
 #if defined(__aarch64__) || defined(__arm__)
 #  define PMU_LLC_MISS_COUNTER_ID 0x17   // LINE_REFILL
 #  define PMU_LLC_WB_COUNTER_ID   0x18   // LINE_WB
+
+/* Remaining ARMv8 PMUv3 events used as MLP features (EVENTS in
+ * mlp_bw_predictor.py). CPU_CYCLES goes on the dedicated cycle counter, so
+ * all 7 features fit on a Cortex-A72 (6 programmable + cycle counter). */
+#  define PMU_CPU_CYCLES_ID       0x11
+#  define PMU_INST_RETIRED_ID     0x08
+#  define PMU_L1I_CACHE_ID        0x14
+#  define PMU_BUS_ACCESS_ID       0x19  
+#  define PMU_BUS_CYCLES_ID       0x1D
 #elif defined(__x86_64__) || defined(__i386__)
 #  define PMU_LLC_MISS_COUNTER_ID 0x08b0 // OFFCORE_REQUESTS.ALL_DATA_RD
 #  define PMU_LLC_WB_COUNTER_ID   0x40b0 // OFFCORE_REQUESTS.WB
@@ -28,28 +38,36 @@ extern ulong g_total_available_bw_mb;
 
 #endif
 
+#if !defined(__aarch64__)
+#  error "The MLP model is trained on ARMv8 PMU events; build for arm64"
+#endif
+
+
+/* Running totals since module load, exported via /sys/kernel/debug/ar/stats.
+ * Event counts are user-mode only, like the MLP features. Written by the
+ * master thread (counts) and the core's overflow handler (reclaims/throttles). */
+struct ar_stats {
+    u64 ticks;          // Regulation intervals measured
+    u64 cycles;         // CPU_CYCLES
+    u64 instructions;   // INST_RETIRED
+    u64 l2_refill;      // L2D_CACHE_REFILL (read lines)
+    u64 l2_wb;          // L2D_CACHE_WB (write lines)
+    u64 reclaims;       // Read overflows served from the pool
+    u64 throttles;      // Read overflows that throttled the core
+};
+
+/* Single-writer update that concurrent debugfs readers never see torn */
+static inline void stat_add(u64 *stat, u64 v){
+    WRITE_ONCE(*stat, *stat + v);
+}
 
 /* Each CPU core's info */
 struct core_info {
     bool thr;
-    u64 g_read_count_new;
-    u64 g_read_count_old;
-    u64 g_read_count_used;
+    u64 g_read_count_used;  // Read bandwidth used in the last interval (MB/s)
     u64 read_limit;
 
-    u64 g_write_count_new;
-    u64 g_write_count_old;
-    u64 g_write_count_used;
-
-  // History of count of LLC read misses occurred between the regulation intervals.
-  // (Event: Read misses)
-  u64 read_event_hist[HIST_SIZE];
-  
-  // History of count of LLC write-backs occurred between the regulation intervals.
-  // (Event: Write-backs)
-  u64 write_event_hist[HIST_SIZE];
-  
-  u8 ri;  // Ring buffer index (shared for both read and write history)
+    u64 g_write_count_used; // Write bandwidth used in the last interval (MB/s)
 
   u8 cpu_id;
   wait_queue_head_t throttle_evt;
@@ -68,6 +86,15 @@ struct core_info {
   struct perf_event *write_event;
   struct perf_event *cycles_l3miss_event;
 
+  /* All MLP feature counters, in enum mlp_feature order.
+   * feat_event[MLP_EV_L2D_REFILL] and [MLP_EV_L2D_WB] alias read_event and
+   * write_event; the other entries are counting-only events owned here. */
+  struct perf_event *feat_event[MLP_N_EV];
+  u64 feat_count_prev[MLP_N_EV];    // Counter values at the previous tick
+  u64 feat_running_prev[MLP_N_EV];  // Counter running times (ns) at the previous tick
+  bool primed;                      // Baselines above are valid
+  struct ar_stats stats;
+
   // Timer related
   struct hrtimer reg_timer;
   struct irq_work read_irq_work;
@@ -75,19 +102,9 @@ struct core_info {
   // Memory Bandwidth Budget estimate for the core.
   // Computed by master core
   atomic64_t budget_est;
-  /* Each core has an array of weights to generate the prediction */
-  
-  /* Weight matrices for bandwidth prediction */
-  double weight_matrix[HIST_SIZE];         // Weights for read BW estimation (keep original name)
-  double write_weight_matrix[HIST_SIZE];   // Weights for write BW estimation
-  
-  // Read bandwidth estimates (keep original names)
-  s64 next_estimate;      // Next read bandwidth estimate
-  s64 prev_estimate;      // Previous read bandwidth estimate
-  
-  // Write bandwidth estimates (NEW)
-  s64 write_next_estimate;
-  s64 write_prev_estimate;
+  // Total (read + write) bandwidth estimates in MB/s
+  u64 next_estimate;      // Budget for the next interval
+  u64 prev_estimate;      // Budget given for the interval just measured
   
   // Per-core bandwidth limits (for dynamic configuration)
   u64 initial_bw_mb;      // Initial/minimum bandwidth in MB/s
