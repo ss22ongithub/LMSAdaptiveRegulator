@@ -102,19 +102,22 @@ static int master_thread_func(void * data) {
                     struct perf_event* write_event = cinfo->write_event;
                     //struct perf_event* cycles_l3miss_event = cinfo->cycles_l3miss_event;
 
-                    /* Stop the counters */
-                    cinfo->read_event->pmu->stop(cinfo->read_event, PERF_EF_UPDATE);
-                    cinfo->write_event->pmu->stop(cinfo->write_event, PERF_EF_UPDATE);
-                    //cinfo->cycles_l3miss_event->pmu->stop(cinfo->cycles_l3miss_event,PERF_EF_UPDATE);
+                    /* The events live on the regulated CPU, not on this (master) CPU.
+                     * pmu->stop()/start() only touch the *local* PMU registers, so
+                     * use perf_event_read_value(), which IPIs the owning CPU to
+                     * fold in the live hardware count before returning it. */
+                    u64 enabled, running;
 
                     /* Read bandwidth tracking */
                     cinfo->g_read_count_old = cinfo->g_read_count_new;
-                    cinfo->g_read_count_new = convert_events_to_mb(perf_event_count(read_event));
+                    cinfo->g_read_count_new = convert_events_to_mb(
+                        perf_event_read_value(read_event, &enabled, &running));
                     cinfo->g_read_count_used = cinfo->g_read_count_new - cinfo->g_read_count_old;
 
                     /* Write bandwidth tracking */
                     cinfo->g_write_count_old = cinfo->g_write_count_new;
-                    cinfo->g_write_count_new = convert_events_to_mb(perf_event_count(write_event));
+                    cinfo->g_write_count_new = convert_events_to_mb(
+                        perf_event_read_value(write_event, &enabled, &running));
                     cinfo->g_write_count_used = cinfo->g_write_count_new - cinfo->g_write_count_old;
 
                     /* Net bandwidth = read + write */
@@ -182,17 +185,16 @@ static int master_thread_func(void * data) {
                     u64 total_allocation = read_allocation + write_allocation;
                     g_pool_bw_mb += max(0, cinfo->max_bw_limit_mb - total_allocation);
 
-                    /* Allocate budget separately to read and write counters */
-                    local64_set(&cinfo->read_event->hw.period_left, convert_mb_to_events(read_allocation));
-                    local64_set(&cinfo->write_event->hw.period_left, convert_mb_to_events(write_allocation));
+                    /* Allocate budget separately to read and write counters.
+                     * perf_event_period() runs on the owning CPU: it stops the
+                     * event, installs the new period, clears period_left and
+                     * restarts it, so the next overflow fires after exactly this
+                     * many events. A period of 0 is rejected (-EINVAL), hence max 1. */
+                    perf_event_period(read_event, max_t(u64, 1, convert_mb_to_events(read_allocation)));
+                    perf_event_period(write_event, max_t(u64, 1, convert_mb_to_events(write_allocation)));
 
                     /* Unthrottle if the core is in throttle state */
                     atomic_set(&cinfo->throttler_task, false);
-
-                    /* Re-enable the counters */
-                    cinfo->read_event->pmu->start(cinfo->read_event, PERF_EF_RELOAD);
-                    cinfo->write_event->pmu->start(cinfo->write_event, PERF_EF_RELOAD);
-                    //cinfo->cycles_l3miss_event->pmu->start(cinfo->cycles_l3miss_event, PERF_EF_RELOAD);
 
                     /* Update weights separately for read and write */
                     s64 read_error = cinfo->g_read_count_used - cinfo->prev_estimate;

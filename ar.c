@@ -200,7 +200,7 @@ static void ar_handle_read_overflow(struct irq_work *entry)
         AR_DEBUG("%s: CPU(%d) not expected here\n",__func__,cpu_id);
         return;
     }
-    BUG_ON(in_nmi() || !in_irq());
+    BUG_ON(in_nmi() || !in_hardirq());
 
     struct core_info *cinfo = get_core_info(cpu_id);
     BUG_ON(!cinfo);
@@ -397,13 +397,14 @@ void stop_regulation(u8 cpu_id){
 void start_all_regulation(void){
     pr_info("%s: Starting regulation for all cores", __func__);
     
-    /* Signal master thread to unthrottle cores and begin regulation */
-    master_start_regulation();
-    
-    /* Enable perf counters for all cores */
+    /* Enable perf counters for all cores first: the master thread starts
+     * reading/reprogramming them as soon as it is woken below. */
     for (u8 cpu_id = 1; cpu_id <= g_num_regulated_cpus; cpu_id++) {
         start_regulation(cpu_id);
     }
+
+    /* Signal master thread to unthrottle cores and begin regulation */
+    master_start_regulation();
     
     pr_info("%s: All cores regulation started", __func__);
 }
