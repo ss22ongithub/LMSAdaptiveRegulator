@@ -68,9 +68,9 @@ KBUILD_ARCH_FLAGS += CROSS_COMPILE=$(CROSS_COMPILE)
 endif
 
 all:
-	$(MAKE) -C $(KDIR) $(KBUILD_ARCH_FLAGS) M=$(PWD) modules
+	$(MAKE) -C $(KDIR) $(KBUILD_ARCH_FLAGS) M=$(CURDIR) modules
 
 clean:
-	$(MAKE) -C $(KDIR) $(KBUILD_ARCH_FLAGS) M=$(PWD) clean
+	$(MAKE) -C $(KDIR) $(KBUILD_ARCH_FLAGS) M=$(CURDIR) clean
 
 .PHONY: all clean
