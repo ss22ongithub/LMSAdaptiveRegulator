@@ -1,6 +1,9 @@
 MODULE_NAME := areg
-$(MODULE_NAME)-objs := ar.o ar_debugfs.o ar_perfs.o model.o master.o utils.o
+$(MODULE_NAME)-objs := ar.o ar_debugfs.o ar_perfs.o models/model_lms.o master.o utils.o
 obj-m += $(MODULE_NAME).o
+
+# Let objects in subdirectories (models/) include headers from the module root.
+ccflags-y += -I$(src)
 
 # --- Build target selection ---------------------------------------------
 # Native build (default): just run `make`. ARCH/CROSS_COMPILE are left
@@ -46,7 +49,7 @@ endif
 # plain `double` arithmetic (LMS weight updates, print_double()), so remove
 # it for just those objects. No-op on x86/riscv, where the flag is never
 # added in the first place.
-CFLAGS_REMOVE_model.o  += -mgeneral-regs-only
+CFLAGS_REMOVE_models/model_lms.o += -mgeneral-regs-only
 CFLAGS_REMOVE_master.o += -mgeneral-regs-only
 CFLAGS_REMOVE_utils.o  += -mgeneral-regs-only
 

@@ -2,7 +2,7 @@
  * Dynamic adaptive memory bandwidth controller for multi-core systems
  *
  *
- * This file is distributed under GPL v2 License. 
+ * This file is distributed under GPL v2 License.
  * See LICENSE.TXT for details.
  *
  */
@@ -17,7 +17,7 @@
 #include "ar_debugfs.h"
 #include "ar_perfs.h"
 #include "utils.h"
-#include "model.h"
+#include "models/model_lms.h"
 
 /**************************************************************************
  * Public Definitions
@@ -83,7 +83,7 @@ struct core_info* get_core_info(u8 cpu_id){
         pr_err("Invalid CPU ID %u (CPU 0 is master, max supported: %d)!!!", cpu_id, MAX_NO_CPUS);
         return NULL;
     }
-    
+
     return &all_cinfo[cpu_id];
 }
 
@@ -236,7 +236,7 @@ static int  setup_cpu_info(const u8 cpu_id){
     /* Initialize per-core bandwidth limits from global arrays */
     cinfo->initial_bw_mb = g_initial_bw_mb[cpu_id];
     cinfo->max_bw_limit_mb = g_percore_bw_limit_mb[cpu_id];
-    pr_info("CPU %d: initial_bw=%llu MB/s, max_bw=%llu MB/s\n", 
+    pr_info("CPU %d: initial_bw=%llu MB/s, max_bw=%llu MB/s\n",
             cpu_id, cinfo->initial_bw_mb, cinfo->max_bw_limit_mb);
 
     cinfo->read_event =  init_counter(cinfo->cpu_id,
@@ -247,7 +247,7 @@ static int  setup_cpu_info(const u8 cpu_id){
         pr_err("Read_event %p did not allocate ", cinfo->read_event);
         return -1;
     }
-    
+
     cinfo->write_event = init_counter(cinfo->cpu_id,
                                       convert_mb_to_events(g_initial_bw_mb[cpu_id]),
                                       PMU_LLC_WB_COUNTER_ID,
@@ -256,7 +256,7 @@ static int  setup_cpu_info(const u8 cpu_id){
         pr_err("Write_event %p did not allocate ", cinfo->write_event);
         return -1;
     }
-    
+
     /* cycles_l3miss_event disabled
     cinfo->cycles_l3miss_event = init_counter(cinfo->cpu_id,6,
                                        PMU_STALL_L3_MISS_CYCLES_COUNTER_ID,
@@ -272,8 +272,8 @@ static int  setup_cpu_info(const u8 cpu_id){
     init_irq_work(&cinfo->read_irq_work, ar_handle_read_overflow);
 
     /* Disable the throttle flag */
-    atomic_set(&cinfo->throttler_task,false);   
-    
+    atomic_set(&cinfo->throttler_task,false);
+
 
     /* Initialize Wait queue for throttler */
     init_waitqueue_head(&cinfo->throttle_evt);
@@ -316,15 +316,15 @@ static int  setup_cpu_info(const u8 cpu_id){
 static void deinitialize_cpu_info( const u8 cpu_id){
 
     pr_info("%s:Enter CPU (%d)",__func__, cpu_id );
-    
+
     struct core_info *cinfo = get_core_info(cpu_id);
-    
+
     BUG_ON(cinfo == NULL);
-        
+
     /* As much as possible keep the de-initialization in the reverse sequence of initialization
      * Refer: setup_cpu_info()
      * */
-    
+
     //End the throttle thread
     if(cinfo->throttler_thread){
         atomic_set(&cinfo->throttler_task, false);  // Unthrottle first
@@ -335,36 +335,36 @@ static void deinitialize_cpu_info( const u8 cpu_id){
         atomic_set(&cinfo->throttler_task,false);
         cinfo->throttler_thread = NULL;
     }
-    
+
     //Free the perf event counters
     if (cinfo->read_event) {
         disable_event(cinfo->read_event);
         cinfo->read_event = NULL;
     }
-    
+
     if (cinfo->write_event) {
         disable_event(cinfo->write_event);
         cinfo->write_event = NULL;
     }
-    
+
     /* cycles_l3miss_event disabled
     if (cinfo->cycles_l3miss_event) {
         disable_event(cinfo->cycles_l3miss_event);
         cinfo->cycles_l3miss_event = NULL;
     }
     */
-    
+
     pr_info("%s:Exit",__func__ );
 }
 
 void start_regulation(u8 cpu_id){
     struct core_info* cinfo = get_core_info(cpu_id);
     BUG_ON(cinfo==NULL);
-    
+
     /* Initialize read estimates */
     cinfo->next_estimate = 0;
     cinfo->prev_estimate = 0;
-    
+
     /* Initialize write estimates */
     cinfo->write_next_estimate = 0;
     cinfo->write_prev_estimate = 0;
@@ -396,29 +396,29 @@ void stop_regulation(u8 cpu_id){
 /* New wrapper function that coordinates regulation start */
 void start_all_regulation(void){
     pr_info("%s: Starting regulation for all cores", __func__);
-    
+
     /* Signal master thread to unthrottle cores and begin regulation */
     master_start_regulation();
-    
+
     /* Enable perf counters for all cores */
     for (u8 cpu_id = 1; cpu_id <= g_num_regulated_cpus; cpu_id++) {
         start_regulation(cpu_id);
     }
-    
+
     pr_info("%s: All cores regulation started", __func__);
 }
 
 void stop_all_regulation(void){
     pr_info("%s: Stopping regulation for all cores", __func__);
-    
+
     /* Stop master thread regulation */
     master_stop_regulation();
-    
+
     /* Disable perf counters for all cores */
     for (u8 cpu_id = 1; cpu_id <= g_num_regulated_cpus; cpu_id++) {
         stop_regulation(cpu_id);
     }
-    
+
     pr_info("%s: All cores regulation stopped", __func__);
 }
 
