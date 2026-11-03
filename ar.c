@@ -200,7 +200,7 @@ static void ar_handle_read_overflow(struct irq_work *entry)
         AR_DEBUG("%s: CPU(%d) not expected here\n",__func__,cpu_id);
         return;
     }
-    BUG_ON(in_nmi() || !in_irq());
+    BUG_ON(in_nmi() || !in_hardirq());
 
     struct core_info *cinfo = get_core_info(cpu_id);
     BUG_ON(!cinfo);

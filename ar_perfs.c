@@ -22,7 +22,7 @@ static struct irq_work llc_miss_event_irq_work;
 static u64 llc_overflow_count =0 ;
 static void llc_miss_event_irq_work_handler(struct irq_work *entry){
     
-    BUG_ON(in_nmi() || !in_irq());
+    BUG_ON(in_nmi() || !in_hardirq());
 //    struct core_info * cinfo = get_core_info(cpu_id);
     // s64 read_budget_used = llc_overflow_count= perf_event_count(llc_miss_read_event) - (cinfo->g_read_count_old);
 
