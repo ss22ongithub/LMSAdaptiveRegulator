@@ -11,7 +11,7 @@
 #define CACHE_LINE_SIZE 64
 extern u32  get_regulation_time(void);
 /** convert MB/s to #of events (i.e., LLC miss counts) per 1ms */
-u64 convert_mb_to_events(int mb);
+u64 convert_mb_to_events(u64 mb);
 
 /* Convert # of events to MB/s */
 u64 convert_events_to_mb(u64 events);
