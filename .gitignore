@@ -26,3 +26,6 @@ tmp/
 refactorings/
 cmake-build-debug
 
+
+# Shared commit message template (see CLAUDE.md)
+!.gitmessage
