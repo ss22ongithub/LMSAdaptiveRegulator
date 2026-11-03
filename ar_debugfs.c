@@ -63,6 +63,10 @@ static ssize_t ar_reg_interval_write(struct file *filp,
         return ret;
     }
 
+    /* Used as a divisor in the bandwidth conversions */
+    if (tmp == 0)
+        return -EINVAL;
+
     ar_regulation_time_ms =  tmp;
     return cnt;
 }
