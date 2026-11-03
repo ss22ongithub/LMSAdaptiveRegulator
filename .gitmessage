@@ -1,0 +1,18 @@
+
+# ^ Subject: imperative mood, <= 72 chars, then a blank line.
+#
+# Body: what changed and why. Wrap at 72 columns.
+#
+# Fill in every field below (lines starting with '#' are removed):
+#   PR=          PR#<number>, e.g. PR=PR#41 (leave empty until the PR exists)
+#   Test=        what was actually built/run, e.g. x86_64 build against
+#                6.18 headers; arm64 RPi cross-compile; insmod/rmmod on RPi.
+#                Say "Not run on hardware." if it wasn't.
+#   Tested-by=   Name <email> of the person who actually tested it
+#   Reviewed-by= Name <email> of the reviewer
+#
+# Do not add a Co-Authored-By line.
+PR=
+Test=
+Tested-by=
+Reviewed-by=
