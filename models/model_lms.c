@@ -1,6 +1,6 @@
 #include "kernel_headers.h"
 #include "ar.h"
-#include "model.h"
+#include "model_lms.h"
 /**********************  Static Function Prototypes **********************************************/
 static double lms_predict(const u64* feat, u8 feat_len,double *wm, u8 wm_len, u8 ri);
 //static double avg(const u64 * f , u8 len );

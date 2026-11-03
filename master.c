@@ -3,7 +3,7 @@
 #include "ar.h"
 #include "ar_perfs.h"
 #include "utils.h"
-#include "model.h"
+#include "models/model_lms.h"
 
 static struct task_struct* mthread = NULL;
 
