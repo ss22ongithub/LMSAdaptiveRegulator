@@ -1,0 +1,11 @@
+[PASS] A. Makefile: SSE only for ml_fpu.o, right objects linked
+[PASS] A. ar_makefile: SSE only for ml_fpu.o, right objects linked
+[PASS] B. source structure (begin / ONE call / end, guards, no FP outside ml_fpu.c)
+[PASS] C. no FP/SSE instruction or soft-float call in any of the 7 non-FPU objects
+[PASS] C. mlpred.o: irq_fpu_usable -> kernel_fpu_begin -> ONE ml_*_fpu call -> kernel_fpu_end
+[PASS] D. control: scanner flags ml_fpu.c built with SSE (252570 SSE instructions found)
+[PASS] D. control: scanner flags a deliberate double multiply (soft-float calls: ['___muldf3', '___adddf3'])
+[PASS] D. control: structure check rejects 5/5 bad begin/end snippets
+[PASS] D. control: context check finds ml_predict() inside an IRQ-context function (caller resolved as ar_sample_and_rearm())
+
+RESULT: ALL PASS - floating point is confined to ml_fpu.c and only runs inside kernel_fpu_begin()/end()

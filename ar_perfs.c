@@ -48,16 +48,33 @@ inline u64 perf_event_count(struct perf_event *event)
         atomic64_read(&event->child_count);
 }
 
+/** Cumulative count of an event that keeps running (see ar_perfs.h). */
+u64 perf_event_read_total(struct perf_event *event)
+{
+    u64 enabled, running;
+
+    if (!event)
+        return 0;
+    return perf_event_read_value(event, &enabled, &running);
+}
+
 struct perf_event *init_counter(int cpu, int sample_period, int counter_id, void *callback)
+{
+    return init_counter_typed(cpu, PERF_TYPE_RAW, (u64)counter_id,
+                              (u64)sample_period, callback);
+}
+
+struct perf_event *init_counter_typed(int cpu, u32 type, u64 config,
+                                      u64 sample_period, void *callback)
 {
     struct perf_event *event = NULL;
     struct perf_event_attr sched_perf_hw_attr = {
-        .type       = PERF_TYPE_RAW,
+        .type       = type,
         .size       = sizeof(struct perf_event_attr),
         .pinned     = 1,
         .disabled   = 1,
         .sample_period = sample_period,
-        .config         = counter_id,
+        .config         = config,
         .exclude_kernel = 1   /* TODO: 1 mean, no kernel mode counting */
     };
 
@@ -103,7 +120,7 @@ struct perf_event *init_counter(int cpu, int sample_period, int counter_id, void
         return NULL;
     }
 
-    pr_info("CPU%d configured counter 0x%x\n", cpu, counter_id);
+    pr_info("CPU%d configured counter type=%u config=0x%llx\n", cpu, type, config);
     return event;
 }
 
@@ -123,9 +140,13 @@ void enable_event(struct perf_event *event){
 }
 
 void disable_event(struct perf_event *event){
+    /* Read the config before releasing: the original printed
+     * event->attr.config after perf_event_release_kernel() (use after free). */
+    const u64 config = event->attr.config;
+
     perf_event_disable(event);
     perf_event_release_kernel(event);
-    pr_info("Perf event disabled (%llx)\n", event->attr.config);
+    pr_info("Perf event disabled (%llx)\n", config);
 
 }
 

@@ -4,46 +4,12 @@
 #include "kernel_headers.h"
 #include "utils.h"
 
-void print_double(char* buf, double value)
-{
-    int digits;
-    int i;
-    int k;
-
-    /*Extract the sign*/
-    i=0;
-    if (value < 0 ) {
-        buf[i++] = '-';
-        value = value *(-1);
-    }
-
-    /*Count the number of digits before the decimal point*/
-    digits = 1;
-    while (value >= 10){
-        value /= 10; digits++;
-    }
-//  WARN_ON(digits <= DOUBLE_LEN - 2);
-
-    for (k = 0; k < DOUBLE_LEN - 2; k++)
-    {
-        buf[i] = '0';
-        while (value >= 1 && buf[i] < '9')
-        {
-            buf[i]++;
-            value -= 1;
-        }
-        i++;
-        digits--;
-        if (digits == 0)
-        {
-            buf[i] = '.';
-            i++;
-        }
-        value *= 10;
-    }
-//  WARN_ON(i == DOUBLE_LEN - 1);
-    buf[i] = 0;
-}
+/*
+ * print_double() was removed in the ML copy: it did `double` arithmetic, and
+ * this object is deliberately built without SSE (only models/model-xgb-fpu.o may contain
+ * floating-point code). Nothing used it any more once the LMS weight dump in
+ * master.c was dropped.
+ */
 
 u64 convert_events_to_mb(u64 events)
 {
