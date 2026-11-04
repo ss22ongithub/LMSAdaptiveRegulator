@@ -1,0 +1,36 @@
+Streaming C predictor (mlpred.c + ml_fpu.c) vs Python  [model: xgboost_mem_next_1ms]
+
+Unit tests (host/test_mlpred.c): PASS
+  ML_N_CNT=6 ML_N_FEATURES=33
+    stream of 4000 samples (reset at -1): 399 predictions, 398 scored, features and tracker match the naive reference
+    stream of 4000 samples (reset at 1234): 397 predictions, 395 scored, features and tracker match the naive reference
+    stream of 4000 samples (reset at 7): 398 predictions, 397 scored, features and tracker match the naive reference
+    output clamping: NaN/negative -> 0, truncation, cap at 1000000
+    ml_selftest(): 0
+  all unit tests passed
+
+Model counters (must equal enum ml_counter in mlpred.h): ['rd', 'wr', 'cyc', 'ins', 'ld', 'cref']; 33 features
+  workload         run examples  C preds resets features raw bit-ident  int tracker  RMSE rd  RMSE wr  result
+  500.perlbench_r    5    30188    30223     35     same      100.000%   ok      ok   459.03    23.52  ok
+  502.gcc_r          5    20423    20462     39     same      100.000%   ok      ok  1363.18    70.80  ok
+  503.bwaves_r       5    40966    41019     53     same      100.000%   ok      ok  1651.94    55.68  ok
+  505.mcf_r          5    30333    30356     24     same      100.000%   ok      ok  1315.49   210.00  ok
+  507.cactuBSSN_r    5    20772    20821     49     same      100.000%   ok      ok   581.68    87.52  ok
+  508.namd_r         5    18613    18631     18     same      100.000%   ok      ok    59.81    13.71  ok
+  510.parest_r       5    40926    40971     45     same      100.000%   ok      ok   377.74     9.40  ok
+  511.povray_r       5    33178    33199     21     same      100.000%   ok      ok     8.90     0.22  ok
+  519.lbm_r          5    22175    22200     25     same      100.000%   ok      ok   995.16   110.33  ok
+  520.omnetpp_r      5    37101    37182     81     same      100.000%   ok      ok   478.34    15.61  ok
+  525.x264_r         5    14126    14136     10     same      100.000%   ok      ok   222.92    18.59  ok
+  526.blender_r      5    27722    27761     39     same      100.000%   ok      ok   673.68    24.56  ok
+  531.deepsjeng_r    5    25739    25745      6     same      100.000%   ok      ok    84.33    12.27  ok
+  538.imagick_r      5    34035    34067     32     same      100.000%   ok      ok    54.62    18.48  ok
+  541.leela_r        5    42916    42975     59     same      100.000%   ok      ok    38.02     5.96  ok
+  544.nab_r          5    28208    28244     36     same      100.000%   ok      ok    53.93     2.16  ok
+  548.exchange2_r    5    17052    17066     14     same      100.000%   ok      ok     5.30     0.15  ok
+  549.fotonik3d_r    5    40557    40651     95     same      100.000%   ok      ok  1414.79    45.86  ok
+  554.roms_r         5    21896    21955     61     same      100.000%   ok      ok  1651.49    86.55  ok
+  557.xz_r           5    35401    35435     34     same      100.000%   ok      ok   220.74    42.23  ok
+  All: 582327 examples, RMSE (C) read=837.368 write=63.932 MiB/s
+
+RESULT: ALL PASS

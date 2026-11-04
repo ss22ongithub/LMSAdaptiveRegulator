@@ -24,9 +24,6 @@ u64 convert_events_to_mb(u64 events);
 //                 (int)in_nmi(), (int)irqs_disabled());
 //}
 
-#define PRECISION 8
-#define DOUBLE_LEN (PRECISION + 3)
-void print_double(char* buf, double value);
-
+/* print_double() removed: no floating point outside models/model-xgb-fpu.c (see Makefile). */
 
 #endif //ADAPTIVEREGULATOR_UTILS_H

@@ -3,16 +3,21 @@ BLDDIR= /lib/modules/$(KVERSION)/build
 
 MODULE_NAME=areg
 
-# Enable FPU
-ccflags-y := -mhard-float -msse
+# SSE/double ONLY for models/model-xgb-fpu.o (all float code, called between
+# kernel_fpu_begin()/end() from models/model-xgb.c). Never put -msse in ccflags-y: that
+# lets the compiler emit SSE anywhere, outside any FPU section, which corrupts
+# user FPU state. See the main Makefile for the full explanation.
+CFLAGS_models/model-xgb-fpu.o += -mhard-float -msse -msse2
+CFLAGS_REMOVE_models/model-xgb-fpu.o += -mgeneral-regs-only
 
 # Disable Trace prints -TODO: Does not work
 # ccflags-y += -D"trace_printk(fmt, ...)="
 
+ccflags-y += -I$(src)
 obj-m += $(MODULE_NAME).o
-$(MODULE_NAME)-objs := ar.o ar_debugfs.o ar_perfs.o model.o master.o utils.o
+$(MODULE_NAME)-objs := ar.o ar_debugfs.o ar_perfs.o models/model-xgb.o models/model-xgb-fpu.o master.o utils.o
 
-all: 
+all:
 	make -C $(BLDDIR) M=$(PWD) modules
 
 clean:

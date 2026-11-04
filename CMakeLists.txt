@@ -32,6 +32,10 @@ add_library(dummy  OBJECT
     kernel_headers.h
     master.c
     master.h
+    models/model-xgb.c
+    models/model-xgb.h
+    models/model-xgb-fpu.c
+    models/model-xgb-fpu.h
     model.c
     model.h
     utils.c

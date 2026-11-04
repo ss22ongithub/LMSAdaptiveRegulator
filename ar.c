@@ -2,7 +2,7 @@
  * Dynamic adaptive memory bandwidth controller for multi-core systems
  *
  *
- * This file is distributed under GPL v2 License.
+ * This file is distributed under GPL v2 License. 
  * See LICENSE.TXT for details.
  *
  */
@@ -17,7 +17,6 @@
 #include "ar_debugfs.h"
 #include "ar_perfs.h"
 #include "utils.h"
-#include "models/model_lms.h"
 
 /**************************************************************************
  * Public Definitions
@@ -42,11 +41,12 @@ static void ar_handle_read_overflow(struct irq_work *entry);
  * Module parameters
 **************************************************************************/
 
-static int g_read_counter_id = PMU_LLC_MISS_COUNTER_ID;
-module_param(g_read_counter_id, hexint,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
-
-static int g_write_counter_id = PMU_LLC_WB_COUNTER_ID;
-module_param(g_write_counter_id, hexint,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
+/*
+ * (The g_read_counter_id / g_write_counter_id parameters -- raw OFFCORE
+ * event codes -- were removed in the 1 ms ML version: the model predicts
+ * per-core "calc" bandwidth, so the throttling events must be exactly the
+ * events it was trained on. See ml_counter_defs below.)
+ */
 
 
 //Default global pool is zero .It will be filled with unused bandwidths.
@@ -54,12 +54,77 @@ module_param(g_write_counter_id, hexint,  S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP)
 ulong g_pool_bw_mb = 0;
 module_param(g_pool_bw_mb, ulong, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP);
 
+/*
+ * ML budget policy. The original LMS-AR limits (500 initial / 1000 max MB/s
+ * per core) were sized for an LMS estimate of a few hundred MB/s; the ML
+ * model sees whole-workload bandwidth (lbm: ~7000 MB/s read, ~4000 write on
+ * one core), so they are now parameters. Defaults follow the sustainable
+ * bandwidth measured on the test platform (LMSARTechnicalReport.pdf, section
+ * V-C): 6000 MB/s read + 4000 MB/s write shared by 4 regulated cores
+ * => 2500 MB/s read+write per core.
+ *
+ *   per-class budget (read, write) =
+ *       clamp(prediction * ml_scale_pct / 100 + ml_headroom_mb,
+ *             ml_initial_bw_mb, ml_max_bw_mb)
+ *
+ * The default headroom equals the old LMS "+ initial_bw_mb" term, so with
+ * scale = 100 the budget is "predicted floor + the same slack LMS-AR gave".
+ * Scale and headroom can be changed at run time through
+ * /sys/module/areg/parameters/; initial and max only at insmod.
+ */
+ulong ml_initial_bw_mb = 500;
+module_param(ml_initial_bw_mb, ulong, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(ml_initial_bw_mb, "warm-up budget and per-class budget floor per core (MB/s)");
+
+ulong ml_max_bw_mb = 2500;
+module_param(ml_max_bw_mb, ulong, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(ml_max_bw_mb, "per-core cap on read+write budget (MB/s)");
+
+ulong ml_scale_pct = 100;
+module_param(ml_scale_pct, ulong, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(ml_scale_pct, "budget = prediction * scale/100 + headroom");
+
+ulong ml_headroom_mb = 500;
+module_param(ml_headroom_mb, ulong, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(ml_headroom_mb, "budget = prediction * scale/100 + headroom (MB/s)");
+
+/*
+ * Master switch for the ML predictor, OFF by default. While it is off the
+ * module regulates every core with the static warm-up budget and executes no
+ * floating-point code at all. Turn it on at run time:
+ *     echo 1 > /sys/module/areg/parameters/ml_enable
+ * (or insmod areg.ko ml_enable=1). The first time it is turned on, the master
+ * thread runs a one-off self-test of the float code; if that fails, or the FPU
+ * is unusable in that context, the predictor stays off. Writing 0 switches it
+ * off again immediately and returns every core to the warm-up budget.
+ */
+bool ml_enable = false;
+module_param(ml_enable, bool, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(ml_enable, "enable the ML predictor (0 = static budgets, no FPU use)");
+
+/**************************************************************************
+ * ML model counters (models/model-xgb.h ML_COUNTER_LIST): perf type / config per input
+ **************************************************************************/
+
+struct ml_counter_def {
+    const char *name;
+    u32 type;
+    u64 config;
+};
+
+#define ML_DEF_ENTRY(id, nm, ty, cfg) [id] = { .name = nm, .type = ty, .config = (u64)(cfg) },
+static const struct ml_counter_def ml_counter_defs[ML_N_CNT] = {
+    ML_COUNTER_LIST(ML_DEF_ENTRY)
+};
+#undef ML_DEF_ENTRY
+
 /**************************************************************************
  * Global Variables
  **************************************************************************/
 
-u64 g_initial_bw_mb[MAX_NO_CPUS+1] = {0,500,500,500,500}; /*Pre-defined initial / min Bandwidth in MB/s */
-const u64 g_percore_bw_limit_mb[MAX_NO_CPUS+1] = {0,1000,1000,1000,1000}; /*Pre-defined max Bandwidth per core in MB/s */
+/* Filled from the ml_* module parameters in ar_init(). */
+u64 g_initial_bw_mb[MAX_NO_CPUS+1];       /* initial / min bandwidth per core, MB/s */
+u64 g_percore_bw_limit_mb[MAX_NO_CPUS+1]; /* max read+write bandwidth per core, MB/s */
 
 /* CPU 0 is always the master core (kernel ties boot/IRQ-affine duties to it,
  * so it's never a good regulation target); CPUs 1..g_num_regulated_cpus are
@@ -83,8 +148,16 @@ struct core_info* get_core_info(u8 cpu_id){
         pr_err("Invalid CPU ID %u (CPU 0 is master, max supported: %d)!!!", cpu_id, MAX_NO_CPUS);
         return NULL;
     }
-
+    
     return &all_cinfo[cpu_id];
+}
+
+bool ar_ml_counters_available(void)
+{
+    for (u8 cpu_id = 1; cpu_id <= g_num_regulated_cpus; cpu_id++)
+        if (!all_cinfo[cpu_id].ml_counters_ok)
+            return false;
+    return true;
 }
 
 
@@ -167,8 +240,15 @@ static int throttler_task_func1(void * data){
 
         AR_DEBUG("CPU(%d):Throttling with MWAIT...\n",cpu_id);
 
-        while (atomic_read(&cinfo->throttler_task) && !kthread_should_stop())
+        while (atomic_read(&cinfo->throttler_task) && !kthread_should_stop()) {
             ar_throttle_cpu_wait(cinfo);
+            /* This SCHED_FIFO loop never sleeps. On a voluntary-preemption
+             * kernel (Fedora's default) nothing preempts it, so the stopper,
+             * watchdog and RCU work of this CPU never run -> soft lockups.
+             * cond_resched() lets only those higher-priority threads in;
+             * ordinary tasks on a throttled core stay blocked. */
+            cond_resched();
+        }
 
         AR_DEBUG("CPU(%d):Unthrottled\n",cpu_id);
     }
@@ -236,44 +316,64 @@ static int  setup_cpu_info(const u8 cpu_id){
     /* Initialize per-core bandwidth limits from global arrays */
     cinfo->initial_bw_mb = g_initial_bw_mb[cpu_id];
     cinfo->max_bw_limit_mb = g_percore_bw_limit_mb[cpu_id];
-    pr_info("CPU %d: initial_bw=%llu MB/s, max_bw=%llu MB/s\n",
+    pr_info("CPU %d: initial_bw=%llu MB/s, max_bw=%llu MB/s\n", 
             cpu_id, cinfo->initial_bw_mb, cinfo->max_bw_limit_mb);
 
-    cinfo->read_event =  init_counter(cinfo->cpu_id,
-                                     convert_mb_to_events(g_initial_bw_mb[cpu_id]),
-                                     g_read_counter_id,
-                                     read_event_overflow_callback);
+    /*
+     * Throttling events = the per-core bandwidth the ML model predicts:
+     *   read  : cache-misses      (generic PERF_COUNT_HW_CACHE_MISSES)
+     *   write : LLC-store-misses  (generic LL / write / miss cache event)
+     * the same generic events `perf stat -e cache-misses,LLC-store-misses`
+     * used to record bw_dataset_all, so the kernel resolves them to the same
+     * hardware events on the same CPU.
+     */
+    cinfo->read_event = init_counter_typed(cinfo->cpu_id,
+                                           ml_counter_defs[ML_RD].type,
+                                           ml_counter_defs[ML_RD].config,
+                                           convert_mb_to_events(g_initial_bw_mb[cpu_id]),
+                                           read_event_overflow_callback);
     if (cinfo->read_event == NULL){
-        pr_err("Read_event %p did not allocate ", cinfo->read_event);
+        pr_err("Read_event (%s) did not allocate ", ml_counter_defs[ML_RD].name);
         return -1;
     }
 
-    cinfo->write_event = init_counter(cinfo->cpu_id,
-                                      convert_mb_to_events(g_initial_bw_mb[cpu_id]),
-                                      PMU_LLC_WB_COUNTER_ID,
-                                      NULL);  /* No callback for write - we don't throttle on write alone */
+    cinfo->write_event = init_counter_typed(cinfo->cpu_id,
+                                            ml_counter_defs[ML_WR].type,
+                                            ml_counter_defs[ML_WR].config,
+                                            convert_mb_to_events(g_initial_bw_mb[cpu_id]),
+                                            NULL);  /* No callback for write - we don't throttle on write alone */
     if (cinfo->write_event == NULL){
-        pr_err("Write_event %p did not allocate ", cinfo->write_event);
+        pr_err("Write_event (%s) did not allocate ", ml_counter_defs[ML_WR].name);
         return -1;
     }
 
-    /* cycles_l3miss_event disabled
-    cinfo->cycles_l3miss_event = init_counter(cinfo->cpu_id,6,
-                                       PMU_STALL_L3_MISS_CYCLES_COUNTER_ID,
-                                       NULL);
-
-    if (cinfo->cycles_l3miss_event == NULL){
-        pr_err("Cycles_l3miss_event %p did not allocate ", cinfo->cycles_l3miss_event);
-        return -1;
+    /*
+     * The other model inputs: plain counting events (no budget, no overflow
+     * callback). If one cannot be created the regulator still works with
+     * static budgets, but the ML predictor refuses to switch on
+     * (ar_ml_counters_available()): the model has no meaning without its
+     * inputs. With SMT on a core has only 4 general-purpose counters; see
+     * README_ML.md for the counter budget.
+     */
+    cinfo->ml_counters_ok = true;
+    for (int i = 0; i < ML_N_CNT; i++) {
+        if (i == ML_RD || i == ML_WR)
+            continue;
+        cinfo->cnt_event[i] = init_counter_typed(cinfo->cpu_id, ml_counter_defs[i].type,
+                                                 ml_counter_defs[i].config, 0, NULL);
+        if (cinfo->cnt_event[i] == NULL) {
+            pr_warn("CPU %d: ML counter %s unavailable: the ML predictor cannot be enabled\n",
+                    cpu_id, ml_counter_defs[i].name);
+            cinfo->ml_counters_ok = false;
+        }
     }
-    */
 
     /* Initialize NMI irq_work_queue */
     init_irq_work(&cinfo->read_irq_work, ar_handle_read_overflow);
 
     /* Disable the throttle flag */
-    atomic_set(&cinfo->throttler_task,false);
-
+    atomic_set(&cinfo->throttler_task,false);   
+    
 
     /* Initialize Wait queue for throttler */
     init_waitqueue_head(&cinfo->throttle_evt);
@@ -305,9 +405,8 @@ static int  setup_cpu_info(const u8 cpu_id){
     /***** Regulation to be started by setting
     /sys/kernel/debug/ar/enable_regulation to 1 ****/
 
-    /* Initialize weight matrices for both read and write bandwidth estimation */
-    initialize_weight_matrix(cinfo, true);        // Read BW weights
-    initialize_write_weight_matrix(cinfo, true);  // Write BW weights
+    /* (LMS weight initialisation removed: the ML predictor has no weights to
+     * set up; its state is cleared by the master thread when regulation starts.) */
 
     pr_info("%s: Exit", __func__ );
     return 0;
@@ -316,15 +415,15 @@ static int  setup_cpu_info(const u8 cpu_id){
 static void deinitialize_cpu_info( const u8 cpu_id){
 
     pr_info("%s:Enter CPU (%d)",__func__, cpu_id );
-
+    
     struct core_info *cinfo = get_core_info(cpu_id);
-
+    
     BUG_ON(cinfo == NULL);
-
+        
     /* As much as possible keep the de-initialization in the reverse sequence of initialization
      * Refer: setup_cpu_info()
      * */
-
+    
     //End the throttle thread
     if(cinfo->throttler_thread){
         atomic_set(&cinfo->throttler_task, false);  // Unthrottle first
@@ -335,24 +434,24 @@ static void deinitialize_cpu_info( const u8 cpu_id){
         atomic_set(&cinfo->throttler_task,false);
         cinfo->throttler_thread = NULL;
     }
-
+    
     //Free the perf event counters
     if (cinfo->read_event) {
         disable_event(cinfo->read_event);
         cinfo->read_event = NULL;
     }
-
+    
     if (cinfo->write_event) {
         disable_event(cinfo->write_event);
         cinfo->write_event = NULL;
     }
 
-    /* cycles_l3miss_event disabled
-    if (cinfo->cycles_l3miss_event) {
-        disable_event(cinfo->cycles_l3miss_event);
-        cinfo->cycles_l3miss_event = NULL;
+    for (int i = 0; i < ML_N_CNT; i++) {
+        if (cinfo->cnt_event[i]) {
+            disable_event(cinfo->cnt_event[i]);
+            cinfo->cnt_event[i] = NULL;
+        }
     }
-    */
 
     pr_info("%s:Exit",__func__ );
 }
@@ -360,19 +459,17 @@ static void deinitialize_cpu_info( const u8 cpu_id){
 void start_regulation(u8 cpu_id){
     struct core_info* cinfo = get_core_info(cpu_id);
     BUG_ON(cinfo==NULL);
-
-    /* Initialize read estimates */
-    cinfo->next_estimate = 0;
-    cinfo->prev_estimate = 0;
-
-    /* Initialize write estimates */
-    cinfo->write_next_estimate = 0;
-    cinfo->write_prev_estimate = 0;
+    
+    /* (Budget estimates and ML state are reset by the master thread when it
+     * leaves the INITIAL state: it is the only writer of those fields, and it
+     * may already be running when this function is called.) */
 
     /* Enable perf events */
     enable_event(cinfo->read_event);
     enable_event(cinfo->write_event);
-    //enable_event(cinfo->cycles_l3miss_event);
+    for (int i = 0; i < ML_N_CNT; i++)
+        if (cinfo->cnt_event[i])
+            enable_event(cinfo->cnt_event[i]);
 
     /* Note: Timers are not used in this design.
      * Master thread controls regulation timer */
@@ -387,7 +484,9 @@ void stop_regulation(u8 cpu_id){
     /* Disable perf events */
     perf_event_disable(cinfo->read_event);
     perf_event_disable(cinfo->write_event);
-    //perf_event_disable(cinfo->cycles_l3miss_event);
+    for (int i = 0; i < ML_N_CNT; i++)
+        if (cinfo->cnt_event[i])
+            perf_event_disable(cinfo->cnt_event[i]);
 
     /* Note: Timers are not used in this design */
     pr_info("%s: Exit: (CPU %u)",__func__,cpu_id );
@@ -396,29 +495,29 @@ void stop_regulation(u8 cpu_id){
 /* New wrapper function that coordinates regulation start */
 void start_all_regulation(void){
     pr_info("%s: Starting regulation for all cores", __func__);
-
+    
     /* Signal master thread to unthrottle cores and begin regulation */
     master_start_regulation();
-
+    
     /* Enable perf counters for all cores */
     for (u8 cpu_id = 1; cpu_id <= g_num_regulated_cpus; cpu_id++) {
         start_regulation(cpu_id);
     }
-
+    
     pr_info("%s: All cores regulation started", __func__);
 }
 
 void stop_all_regulation(void){
     pr_info("%s: Stopping regulation for all cores", __func__);
-
+    
     /* Stop master thread regulation */
     master_stop_regulation();
-
+    
     /* Disable perf counters for all cores */
     for (u8 cpu_id = 1; cpu_id <= g_num_regulated_cpus; cpu_id++) {
         stop_regulation(cpu_id);
     }
-
+    
     pr_info("%s: All cores regulation stopped", __func__);
 }
 
@@ -456,6 +555,21 @@ static int __init ar_init (void ){
     }
     pr_info("Regulating %d of %d online CPUs (CPU 0 reserved for master)\n",
             g_num_regulated_cpus, num_online_cpus());
+
+    /* Apply the ML budget policy parameters to the per-core limits. */
+    if (ml_initial_bw_mb == 0 || ml_max_bw_mb < 2 * ml_initial_bw_mb) {
+        pr_err("ml_max_bw_mb (%lu) must be >= 2 * ml_initial_bw_mb (%lu): read and write "
+               "each start at the initial budget\n", ml_max_bw_mb, ml_initial_bw_mb);
+        return -EINVAL;
+    }
+    for (u8 i = 1; i <= MAX_NO_CPUS; i++) {
+        g_initial_bw_mb[i] = ml_initial_bw_mb;
+        g_percore_bw_limit_mb[i] = ml_max_bw_mb;
+    }
+    pr_info("ML budget policy: initial=%lu max=%lu scale=%lu%% headroom=%lu (MiB/s); "
+            "sample=%llu us, window=%d samples, %d model counters\n", ml_initial_bw_mb,
+            ml_max_bw_mb, ml_scale_pct, ml_headroom_mb, ML_SAMPLE_NS / 1000ULL,
+            ML_WINDOW, ML_N_CNT);
 
     for (u8 cpu_id = 1; cpu_id <= g_num_regulated_cpus; cpu_id++) {
         int ret = setup_cpu_info(cpu_id);
