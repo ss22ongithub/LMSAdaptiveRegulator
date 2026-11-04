@@ -11,4 +11,11 @@ adaptive filtering technique was employed for prediction of percore bandwidth re
   $ make
   $ insmod areg.ko
   $ echo 1 >  /sys/kernel/debug/ar/enable_regulation
+
+  The regulation starts at this point . Tests can be run after this.
+
+  To remove the module use
+  $ rmmod areg.ko
+
+   
   ```
